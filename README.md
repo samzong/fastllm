@@ -123,13 +123,11 @@ print()
 - 教学和学习 LLM API 调用
 - 无需联网的离线演示
 
-## 📝 开发计划
 
-- [ ] 支持模型热切换
-- [ ] 增加简易 Web UI
-- [ ] 支持更多 OpenAI 兼容参数
-- [ ] 添加模型性能基准测试
+## 📝 许可证
 
-## �� 许可证
+MIT License
 
-MIT License 
+Copyright (c) 2024 samzong
+
+详见 [LICENSE](LICENSE) 文件 

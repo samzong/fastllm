@@ -185,7 +185,7 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
     )
     
     # 流式输出标头
-    yield f"data: {json.dumps({
+    yield "data: " + json.dumps({
         'id': request_id,
         'object': 'chat.completion.chunk',
         'created': created,
@@ -195,7 +195,7 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
             'delta': {'role': 'assistant'},
             'finish_reason': None
         }]
-    })}\n\n"
+    }) + "\n\n"
     
     # 追踪之前发送的内容，用于计算增量
     previous_text = ""
@@ -209,7 +209,7 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
             previous_text = current_text
             
             # 发送增量更新
-            yield f"data: {json.dumps({
+            yield "data: " + json.dumps({
                 'id': request_id,
                 'object': 'chat.completion.chunk',
                 'created': created,
@@ -219,10 +219,10 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
                     'delta': {'content': delta_text},
                     'finish_reason': None
                 }]
-            })}\n\n"
+            }) + "\n\n"
     
     # 发送结束标记
-    yield f"data: {json.dumps({
+    yield "data: " + json.dumps({
         'id': request_id,
         'object': 'chat.completion.chunk',
         'created': created,
@@ -232,7 +232,7 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
             'delta': {},
             'finish_reason': 'stop'
         }]
-    })}\n\n"
+    }) + "\n\n"
     
     # 标准的SSE结束标记
     yield "data: [DONE]\n\n"
