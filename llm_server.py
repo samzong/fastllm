@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import multiprocessing
 import argparse
 from typing import List, AsyncGenerator
 import time
@@ -9,15 +10,13 @@ import json
 from contextlib import asynccontextmanager
 
 import torch
-import requests
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from vllm import LLM, SamplingParams
 from vllm.outputs import RequestOutput
 from pydantic import BaseModel
-from huggingface_hub import configure_http_backend
 
 # 配置参数
 class Config:
@@ -75,14 +74,32 @@ def load_model(model_path: str, gpu_count: int = 1) -> LLM:
         print("⚠️ 未检测到GPU，将使用CPU模式")
         gpu_count = 1
     
-    print(f"🔄 加载模型中...")
-    llm = LLM(
-        model=model_path,
-        tensor_parallel_size=gpu_count,
-        trust_remote_code=True,
-        dtype="auto"
-    )
-    print(f"✅ 模型加载完成")
+    print("🔄 加载模型中...")
+    try:
+        if torch.cuda.is_available() and gpu_count > 0:
+            # 预热所有要使用的GPU
+            for i in range(gpu_count):
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+                # 在每个GPU上创建一个小张量来触发CUDA初始化
+                torch.zeros(1, device=f"cuda:{i}")
+
+        # 加载LLM模型
+        llm = LLM(
+            model=model_path,
+            tensor_parallel_size=gpu_count,
+            trust_remote_code=True,
+            dtype="auto",
+            gpu_memory_utilization=0.8,
+            quantization=None,  # 禁用量化以避免潜在问题
+            max_num_batched_tokens=4096,
+            enforce_eager=True,
+            max_model_len=8192  # 明确设置最大序列长度
+        )
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
+        raise
+    print("✅ 模型加载完成")
     return llm
 
 @asynccontextmanager
@@ -91,7 +108,7 @@ async def lifespan(app: FastAPI):
     global llm_model
     model_path = download_model(Config.MODEL_NAME, Config.USE_HF_MIRROR)
     llm_model = load_model(model_path, Config.GPU_COUNT)
-    print(f"🚀 服务就绪")
+    print("🚀 服务就绪")
     yield
     if llm_model:
         del llm_model
@@ -252,9 +269,23 @@ async def health_check():
 
 def main():
     """主函数"""
-    # 获取可用 GPU 数量
+    # 获取可用 GPU 数量并初始化CUDA环境
     available_gpus = get_available_gpu_count()
     default_gpu_count = min(available_gpus, 1) if available_gpus > 0 else 1
+
+    # 初始化CUDA环境
+    if torch.cuda.is_available():
+        # 检查是否有可用的GPU
+        if available_gpus > 0:
+            # 预热所有要使用的GPU
+            for i in range(default_gpu_count):
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+                # 在每个GPU上创建一个小张量来触发CUDA初始化
+                torch.zeros(1, device=f"cuda:{i}")
+            print(f"✅ CUDA环境已初始化 (GPU数量: {default_gpu_count})")
+        else:
+            print("⚠️ 未检测到可用的GPU")
     
     # 解析命令行参数
     parser = argparse.ArgumentParser(
@@ -337,8 +368,26 @@ def main():
     if Config.USE_HF_MIRROR:
         print("   使用HF镜像: hf-mirror.com")
     
-    # 启动服务
-    uvicorn.run(app, host=Config.HOST, port=Config.PORT)
+    # 启动服务（使用单进程模式并配置uvicorn参数）
+    uvicorn.run(
+        app,
+        host=Config.HOST,
+        port=Config.PORT,
+        workers=1,
+        loop="asyncio",
+        http="auto",
+        reload=False,
+        access_log=False,
+        log_level="error",
+        factory=False
+    )
+
+# 在导入时设置多进程启动方法
+try:
+    # 设置multiprocessing启动方法为spawn，以避免CUDA初始化问题
+    multiprocessing.set_start_method('spawn')
+except RuntimeError:
+    pass  # 可能已经设置过了，忽略错误
 
 if __name__ == "__main__":
     main()
