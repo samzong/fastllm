@@ -36,23 +36,6 @@ def get_available_gpu_count() -> int:
         return torch.cuda.device_count()
     return 0
 
-def configure_hf_mirror():
-    """配置 HuggingFace 镜像站点"""
-    # 设置环境变量（兼容性方案）
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-    
-    # 使用官方推荐方式配置HTTP后端
-    def backend_factory() -> requests.Session:
-        session = requests.Session()
-        session.proxies = {
-            "http": "https://hf-mirror.com",
-            "https": "https://hf-mirror.com"
-        }
-        return session
-    
-    configure_http_backend(backend_factory=backend_factory)
-    print("📡 已配置 HuggingFace 镜像: hf-mirror.com")
-
 def download_model(model_name: str, use_hf_mirror: bool = True) -> str:
     """加载模型，支持本地路径或HuggingFace模型 """
     # 最简单的判断：如果路径存在，就是本地模型
@@ -62,10 +45,6 @@ def download_model(model_name: str, use_hf_mirror: bool = True) -> str:
     
     # 否则从HuggingFace下载
     from huggingface_hub import snapshot_download
-    
-    # 配置镜像
-    if use_hf_mirror:
-        configure_hf_mirror()
     
     # 使用模型名称作为目录名
     model_dir = os.path.join(os.getcwd(), model_name.split("/")[-1])
@@ -77,8 +56,8 @@ def download_model(model_name: str, use_hf_mirror: bool = True) -> str:
         model_path = snapshot_download(
             repo_id=model_name,
             local_dir=model_dir,
-            max_workers=4, 
-            local_dir_use_symlinks=False
+            max_workers=8,
+            endpoint="https://hf-mirror.com" if use_hf_mirror else None
         )
         print(f"✅ 下载完成: {model_path}")
         return model_path
@@ -362,4 +341,4 @@ def main():
     uvicorn.run(app, host=Config.HOST, port=Config.PORT)
 
 if __name__ == "__main__":
-    main() 
+    main()
