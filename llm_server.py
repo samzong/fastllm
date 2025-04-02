@@ -8,6 +8,7 @@ from typing import List, AsyncGenerator
 import time
 import json
 from contextlib import asynccontextmanager
+import asyncio
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -195,12 +196,6 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
         temperature=request.temperature
     )
     
-    # 提交生成请求
-    results_generator = llm_model.generate_async(
-        [prompt],
-        sampling_params,
-    )
-    
     # 流式输出标头
     yield "data: " + json.dumps({
         'id': request_id,
@@ -214,16 +209,26 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
         }]
     }) + "\n\n"
     
-    # 追踪之前发送的内容，用于计算增量
-    previous_text = ""
+    # 非流式方式生成完整内容，然后模拟流式输出
+    outputs = llm_model.generate(
+        [prompt],
+        sampling_params,
+    )
     
-    async for result in results_generator:
-        output: RequestOutput = result[0]
-        if output.outputs:
-            current_text = output.outputs[0].text
-            # 计算增量文本
-            delta_text = current_text[len(previous_text):]
-            previous_text = current_text
+    if outputs and outputs[0].outputs:
+        full_text = outputs[0].outputs[0].text
+        
+        # 追踪之前发送的内容，用于计算增量
+        previous_sent = 0
+        
+        # 模拟流式输出：每次发送少量文本
+        chunk_size = 4  # 每次发送几个字符
+        
+        for i in range(0, len(full_text), chunk_size):
+            # 获取当前要发送的文本片段
+            current_end = min(i + chunk_size, len(full_text))
+            delta_text = full_text[previous_sent:current_end]
+            previous_sent = current_end
             
             # 发送增量更新
             yield "data: " + json.dumps({
@@ -237,6 +242,9 @@ async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncG
                     'finish_reason': None
                 }]
             }) + "\n\n"
+            
+            # 模拟流式延迟
+            await asyncio.sleep(0.01)
     
     # 发送结束标记
     yield "data: " + json.dumps({
