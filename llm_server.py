@@ -1,401 +1,119 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
 import os
-import multiprocessing
+import sys
 import argparse
-from typing import List, AsyncGenerator
-import time
-import json
-from contextlib import asynccontextmanager
-import asyncio
+import subprocess
+import signal
 
-import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from vllm import LLM, SamplingParams
-from vllm.outputs import RequestOutput
-from pydantic import BaseModel
+def setup_signal_handler():
+    """Setup signal handler for interruption"""
+    def force_exit(sig, frame):
+        print("\n🛑 Operation interrupted")
+        os._exit(1)
+    
+    signal.signal(signal.SIGINT, force_exit)
+    signal.signal(signal.SIGTERM, force_exit)
 
-# 配置参数
-class Config:
-    HOST = "127.0.0.1"       # 服务监听地址
-    PORT = 8000           # 服务监听端口
-    USE_HF_MIRROR = True  # 是否使用 HuggingFace 镜像
-    GPU_COUNT = 1         # 使用的 GPU 数量
-    MODEL_NAME = None      # 模型名称，将通过命令行参数设置
-
-# 全局变量存储LLM模型实例
-llm_model = None
-
-def get_available_gpu_count() -> int:
-    """获取可用的 GPU 数量"""
-    if torch.cuda.is_available():
-        return torch.cuda.device_count()
-    return 0
-
-def download_model(model_name: str, use_hf_mirror: bool = True) -> str:
-    """加载模型，支持本地路径或HuggingFace模型 """
-    # 最简单的判断：如果路径存在，就是本地模型
+def download_model(model_name, use_hf_mirror=True):
+    """Download model from HuggingFace if not a local path"""
     if os.path.exists(model_name):
-        print(f"📁 使用本地模型: {model_name}")
+        print(f"📁 Using local model: {model_name}")
         return model_name
     
-    # 否则从HuggingFace下载
     from huggingface_hub import snapshot_download
     
-    # 使用模型名称作为目录名
     model_dir = os.path.join(os.getcwd(), model_name.split("/")[-1])
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
     
+    print(f"📥 Downloading from HuggingFace: {model_name}")
     try:
-        print(f"📥 从 HuggingFace 下载: {model_name}")
         model_path = snapshot_download(
             repo_id=model_name,
             local_dir=model_dir,
             max_workers=8,
-            endpoint="https://hf-mirror.com" if use_hf_mirror else None
+            endpoint="https://hf-mirror.com" if use_hf_mirror else None,
+            tqdm_class=None
         )
-        print(f"✅ 下载完成: {model_path}")
+        print(f"\n✅ Download complete: {model_path}")
         return model_path
     except Exception as e:
-        print(f"❌ 下载失败: {e}")
+        print(f"\n❌ Download failed: {e}")
         raise
-
-def load_model(model_path: str, gpu_count: int = 1) -> LLM:
-    """加载模型到VLLM"""
-    available_gpus = get_available_gpu_count()
-    if available_gpus > 0:
-        print(f"🖥️ 检测到GPU: {available_gpus}个")
-        gpu_count = min(gpu_count, available_gpus)
-    else:
-        print("⚠️ 未检测到GPU，将使用CPU模式")
-        gpu_count = 1
-    
-    print("🔄 加载模型中...")
-    try:
-        if torch.cuda.is_available() and gpu_count > 0:
-            # 预热所有要使用的GPU
-            for i in range(gpu_count):
-                torch.cuda.set_device(i)
-                torch.cuda.empty_cache()
-                # 在每个GPU上创建一个小张量来触发CUDA初始化
-                torch.zeros(1, device=f"cuda:{i}")
-
-        # 加载LLM模型
-        llm = LLM(
-            model=model_path,
-            tensor_parallel_size=gpu_count,
-            trust_remote_code=True,
-            dtype="auto",
-            gpu_memory_utilization=0.8,
-            quantization=None,  # 禁用量化以避免潜在问题
-            max_num_batched_tokens=4096,
-            enforce_eager=True,
-            max_model_len=8192  # 明确设置最大序列长度
-        )
-    except Exception as e:
-        print(f"❌ 模型加载失败: {e}")
-        raise
-    print("✅ 模型加载完成")
-    return llm
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """处理应用的生命周期事件"""
-    global llm_model
-    model_path = download_model(Config.MODEL_NAME, Config.USE_HF_MIRROR)
-    llm_model = load_model(model_path, Config.GPU_COUNT)
-    print("🚀 服务就绪")
-    yield
-    if llm_model:
-        del llm_model
-        torch.cuda.empty_cache()
-        print("🛑 服务已停止")
-
-# 创建FastAPI应用
-app = FastAPI(title="LLM API Service", lifespan=lifespan)
-
-# 配置CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# API 数据模型
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 512
-    stream: bool = False
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    """OpenAI兼容的聊天完成接口"""
-    if not llm_model:
-        raise HTTPException(status_code=503, detail="模型尚未加载完成")
-    
-    # 构建提示文本
-    prompt = ""
-    for msg in request.messages:
-        if msg.role == "system":
-            prompt += f"System: {msg.content}\n"
-        elif msg.role == "user":
-            prompt += f"User: {msg.content}\n"
-        elif msg.role == "assistant":
-            prompt += f"Assistant: {msg.content}\n"
-    
-    prompt += "Assistant: "
-    
-    # 如果请求流式输出
-    if request.stream:
-        return StreamingResponse(
-            stream_response(prompt, request),
-            media_type="text/event-stream"
-        )
-    
-    # 非流式输出处理
-    outputs = llm_model.generate(
-        [prompt],
-        SamplingParams(
-            max_tokens=request.max_tokens,
-            temperature=request.temperature
-        )
-    )
-    
-    return {
-        "id": f"chatcmpl-{int(time.time())}",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": outputs[0].outputs[0].text},
-            "finish_reason": "stop"
-        }]
-    }
-
-async def stream_response(prompt: str, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
-    """生成流式响应"""
-    request_id = f"chatcmpl-{int(time.time())}"
-    created = int(time.time())
-    
-    # 创建请求参数
-    sampling_params = SamplingParams(
-        max_tokens=request.max_tokens,
-        temperature=request.temperature
-    )
-    
-    # 流式输出标头
-    yield "data: " + json.dumps({
-        'id': request_id,
-        'object': 'chat.completion.chunk',
-        'created': created,
-        'model': request.model,
-        'choices': [{
-            'index': 0,
-            'delta': {'role': 'assistant'},
-            'finish_reason': None
-        }]
-    }) + "\n\n"
-    
-    # 非流式方式生成完整内容，然后模拟流式输出
-    outputs = llm_model.generate(
-        [prompt],
-        sampling_params,
-    )
-    
-    if outputs and outputs[0].outputs:
-        full_text = outputs[0].outputs[0].text
-        
-        # 追踪之前发送的内容，用于计算增量
-        previous_sent = 0
-        
-        # 模拟流式输出：每次发送少量文本
-        chunk_size = 4  # 每次发送几个字符
-        
-        for i in range(0, len(full_text), chunk_size):
-            # 获取当前要发送的文本片段
-            current_end = min(i + chunk_size, len(full_text))
-            delta_text = full_text[previous_sent:current_end]
-            previous_sent = current_end
-            
-            # 发送增量更新
-            yield "data: " + json.dumps({
-                'id': request_id,
-                'object': 'chat.completion.chunk',
-                'created': created,
-                'model': request.model,
-                'choices': [{
-                    'index': 0,
-                    'delta': {'content': delta_text},
-                    'finish_reason': None
-                }]
-            }) + "\n\n"
-            
-            # 模拟流式延迟
-            await asyncio.sleep(0.01)
-    
-    # 发送结束标记
-    yield "data: " + json.dumps({
-        'id': request_id,
-        'object': 'chat.completion.chunk',
-        'created': created,
-        'model': request.model,
-        'choices': [{
-            'index': 0,
-            'delta': {},
-            'finish_reason': 'stop'
-        }]
-    }) + "\n\n"
-    
-    # 标准的SSE结束标记
-    yield "data: [DONE]\n\n"
-
-@app.get("/v1/models")
-async def list_models():
-    """列出可用模型"""
-    return {
-        "data": [{"id": Config.MODEL_NAME.split("/")[-1]}],
-        "object": "list"
-    }
-
-@app.get("/health")
-async def health_check():
-    """健康检查接口"""
-    return {"status": "healthy", "model_loaded": llm_model is not None}
 
 def main():
-    """主函数"""
-    # 获取可用 GPU 数量并初始化CUDA环境
-    available_gpus = get_available_gpu_count()
-    default_gpu_count = min(available_gpus, 1) if available_gpus > 0 else 1
-
-    # 初始化CUDA环境
-    if torch.cuda.is_available():
-        # 检查是否有可用的GPU
-        if available_gpus > 0:
-            # 预热所有要使用的GPU
-            for i in range(default_gpu_count):
-                torch.cuda.set_device(i)
-                torch.cuda.empty_cache()
-                # 在每个GPU上创建一个小张量来触发CUDA初始化
-                torch.zeros(1, device=f"cuda:{i}")
-            print(f"✅ CUDA环境已初始化 (GPU数量: {default_gpu_count})")
-        else:
-            print("⚠️ 未检测到可用的GPU")
+    setup_signal_handler()
     
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(
-        description='OpenAI 兼容的 LLM API 服务器',
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description='Simple LLM server launcher')
+    parser.add_argument('model_name', type=str, help='Model name or path')
     
-    # 位置参数
-    parser.add_argument(
-        'model_name', 
-        type=str,
-        help='模型名称或路径，例如:\n'
-             '- HF模型: Qwen/Qwen2-0.5B-Instruct\n'
-             '- 本地模型: ./models/my-model\n'
-             '注: 存在路径视为本地模型，否则从HF下载'
-    )
+    # Basic options
+    parser.add_argument('--host', type=str, default="127.0.0.1", help='Host address (default: 127.0.0.1)')
+    parser.add_argument('--port', '-p', type=int, default=8000, help='Port number (default: 8000)')
+    parser.add_argument('--no-hf-mirror', action='store_true', help='Disable HuggingFace mirror')
+    parser.add_argument('--download-only', '-d', action='store_true', help='Download model only, do not start server')
     
-    # 可选参数组
-    group = parser.add_argument_group('可选参数')
-    
-    group.add_argument(
-        '--gpu-count', '-g',
-        type=int, 
-        default=default_gpu_count,
-        help=f'使用的GPU数量 (默认: {default_gpu_count})'
-    )
-    
-    group.add_argument(
-        '--host', 
-        type=str, 
-        default=Config.HOST,
-        help=f'监听地址 (默认: {Config.HOST})'
-    )
-    
-    group.add_argument(
-        '--port', '-p',
-        type=int, 
-        default=Config.PORT,
-        help=f'监听端口 (默认: {Config.PORT})'
-    )
-    
-    group.add_argument(
-        '--no-hf-mirror', 
-        action='store_true',
-        help='不使用HF镜像 (默认: 使用hf-mirror.com)'
-    )
-    
-    group.add_argument(
-        '--download-only', '-d',
-        action='store_true',
-        help='仅下载模型，不启动服务'
-    )
+    # Performance options
+    perf_group = parser.add_argument_group('Performance')
+    perf_group.add_argument('--gpu-count', '-g', type=int, default=1, help='Number of GPUs (default: 1)')
+    perf_group.add_argument('--dtype', type=str, default="auto", choices=['auto', 'half', 'float16', 'bfloat16', 'float', 'float32'], 
+                          help='Data type (default: auto), half/float16 for faster loading on low-end GPUs')
+    perf_group.add_argument('--quantization', type=str, default=None, choices=[None, 'awq', 'gptq'],
+                          help='Quantization method (default: None), AWQ/GPTQ reduces memory usage')
+    perf_group.add_argument('--load-format', type=str, default="auto", choices=['auto', 'safetensors', 'gguf', 'dummy'],
+                          help='Model loading format (default: auto), safetensors is typically fastest')
     
     args = parser.parse_args()
     
-    # 更新配置
-    Config.MODEL_NAME = args.model_name
-    Config.GPU_COUNT = args.gpu_count
-    Config.HOST = args.host
-    Config.PORT = args.port
-    Config.USE_HF_MIRROR = not args.no_hf_mirror
-    
-    # 处理仅下载模式
-    if args.download_only:
-        print(f"📥 下载模式 | 模型: {Config.MODEL_NAME}")
-        if Config.USE_HF_MIRROR:
-            print("   使用HF镜像: hf-mirror.com")
+    try:
+        if args.download_only:
+            print(f"📥 Download mode | Model: {args.model_name}")
+            if not args.no_hf_mirror:
+                print("   Using HF mirror: hf-mirror.com")
+            download_model(args.model_name, not args.no_hf_mirror)
+            return
         
-        try:
-            model_path = download_model(Config.MODEL_NAME, Config.USE_HF_MIRROR)
-            print(f"✅ 模型下载成功: {model_path}")
-            return
-        except Exception as e:
-            print(f"❌ 模型下载失败: {e}")
-            return
+        # Download model if needed
+        model_path = args.model_name
+        if not os.path.exists(model_path):
+            model_path = download_model(model_path, not args.no_hf_mirror)
+        
+        # Build vLLM command
+        cmd = [
+            "vllm", "serve",
+            model_path,
+            "--host", args.host,
+            "--port", str(args.port),
+            "--tensor-parallel-size", str(args.gpu_count),
+            "--dtype", args.dtype
+        ]
+        
+        # Add optional parameters
+        if args.quantization:
+            cmd.extend(["--quantization", args.quantization])
+        
+        if args.load_format != "auto":
+            cmd.extend(["--load-format", args.load_format])
+            
+        # Display startup info
+        print(f"🚀 Starting vLLM server | Model: {model_path}")
+        print(f"   Address: {args.host}:{args.port} | GPUs: {args.gpu_count}")
+        if args.dtype != "auto":
+            print(f"   Data type: {args.dtype}")
+        if args.quantization:
+            print(f"   Quantization: {args.quantization}")
+        if args.load_format != "auto":
+            print(f"   Load format: {args.load_format}")
+            
+        # Start vLLM server
+        result = subprocess.run(cmd)
+        print("✅ Server exited normally" if result.returncode == 0 else f"❌ Server exited with code: {result.returncode}")
+        
+    except Exception as e:
+        print(f"❌ Operation failed: {e}")
+        return 1
     
-    # 启动服务器模式
-    print(f"🚀 启动服务 | 模型: {Config.MODEL_NAME}")
-    print(f"   地址: {Config.HOST}:{Config.PORT} | GPU: {Config.GPU_COUNT}")
-    if Config.USE_HF_MIRROR:
-        print("   使用HF镜像: hf-mirror.com")
-    
-    # 启动服务（使用单进程模式并配置uvicorn参数）
-    uvicorn.run(
-        app,
-        host=Config.HOST,
-        port=Config.PORT,
-        workers=1,
-        loop="asyncio",
-        http="auto",
-        reload=False,
-        access_log=False,
-        log_level="error",
-        factory=False
-    )
-
-# 在导入时设置多进程启动方法
-try:
-    # 设置multiprocessing启动方法为spawn，以避免CUDA初始化问题
-    multiprocessing.set_start_method('spawn')
-except RuntimeError:
-    pass  # 可能已经设置过了，忽略错误
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

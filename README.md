@@ -1,133 +1,103 @@
-# FastLLM - 轻量级大语言模型测试服务
+# FastLLM
 
-一个轻量级、单文件的本地大语言模型 API 服务器，专为快速测试和原型开发而设计。提供 OpenAI 兼容接口，让你在本地环境中快速测试和开发 LLM 应用。
+A minimal LLM server launcher in just ~100 lines of Python code.
 
-## ✨ 核心特性
+## Features
 
-- 🚀 **一键启动**：单文件实现，零配置即可启动服务
-- 🔍 **快速原型**：适合快速验证想法和开发原型
-- 📊 **流式响应**：支持类似 ChatGPT 的实时输出效果
-- 🧩 **即插即用**：完全兼容 OpenAI API，可直接替换现有调用
-- 🌐 **国内友好**：内置 HuggingFace 镜像，无需科学上网
-- 📥 **简易部署**：支持本地模型和一键下载 HuggingFace 模型
+- 🚀 **Simple**: Launch an OpenAI-compatible LLM API server with a single command
+- 📦 **Flexible**: Works with both local models and models from HuggingFace
+- ⚡ **Fast**: Includes optimization options for faster loading and inference
+- 🔄 **Interruptible**: Clean Ctrl+C handling for easy operation
+- 🌐 **HF Mirror**: Built-in support for HuggingFace mirror (for faster downloads in some regions)
 
-## ⚡ 快速开始
+## Requirements
 
-### 1. 安装依赖
+- Python 3.8+
+- vLLM library installed (`pip install vllm`)
+- GPU with CUDA support (recommended)
+
+## Usage
+
+### Basic Usage
 
 ```bash
-pip install vllm fastapi uvicorn torch huggingface_hub
+# Start an LLM server with a local model
+python llm_server.py ./models/my-local-model
+
+# Download and run a model from HuggingFace
+python llm_server.py Qwen/Qwen2-7B-Instruct
+
+# Download without starting the server
+python llm_server.py Qwen/Qwen2-7B-Instruct --download-only
 ```
 
-### 2. 启动服务
+### Optimization Options
 
 ```bash
-# 使用 HuggingFace 模型
-python llm_server.py Qwen/Qwen2-0.5B-Instruct
+# Run with half-precision for faster loading on low-end GPUs
+python llm_server.py Qwen/Qwen2-7B-Instruct --dtype half
 
-# 使用本地模型
-python llm_server.py ./models/my-model
+# Use quantization to reduce memory usage
+python llm_server.py Qwen/Qwen2-7B-Instruct --quantization awq
+
+# Use safetensors format for faster loading
+python llm_server.py Qwen/Qwen2-7B-Instruct --load-format safetensors
+
+# Use multiple GPUs
+python llm_server.py Qwen/Qwen2-7B-Instruct --gpu-count 2
 ```
 
-### 3. 测试接口
+### Server Configuration
+
+```bash
+# Change host and port
+python llm_server.py Qwen/Qwen2-7B-Instruct --host 0.0.0.0 --port 8080
+```
+
+## API Usage
+
+Once the server is running, you can use it as an OpenAI-compatible API endpoint:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen2-0.5B-Instruct",
-    "messages": [{"role": "user", "content": "用一句话介绍你自己"}],
+    "model": "Qwen/Qwen2-7B-Instruct",
+    "messages": [{"role": "user", "content": "Tell me a joke"}],
     "temperature": 0.7
   }'
 ```
 
-## 🔧 命令行参数
-
-```
-python llm_server.py [-h] [--gpu-count GPU_COUNT] [--host HOST] [--port PORT] [--no-hf-mirror] [--download-only] model_name
-```
-
-| 参数 | 说明 |
-|------|------|
-| `model_name` | 模型名称或路径 (必填) |
-| `--gpu-count`, `-g` | 使用的GPU数量 |
-| `--host` | 监听地址 (默认: 127.0.0.1) |
-| `--port`, `-p` | 监听端口 (默认: 8000) |
-| `--no-hf-mirror` | 不使用HuggingFace镜像 |
-| `--download-only`, `-d` | 仅下载模型，不启动服务 |
-
-## 💡 开发示例
-
-### 标准调用
+Or with Python:
 
 ```python
-import requests
+from openai import OpenAI
 
-response = requests.post(
-    "http://localhost:8000/v1/chat/completions",
-    json={
-        "model": "Qwen2-0.5B",
-        "messages": [
-            {"role": "user", "content": "你好，请简要介绍一下你自己"}
-        ]
-    }
+client = OpenAI(base_url="http://localhost:8000/v1")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2-7B-Instruct",
+    messages=[{"role": "user", "content": "Tell me a joke"}]
 )
 
-print(response.json()["choices"][0]["message"]["content"])
+print(response.choices[0].message.content)
 ```
 
-### 流式调用
+## How It Works
 
-```python
-import requests
-import json
+This tool is a thin wrapper around vLLM's `serve` command, adding convenient features like:
 
-response = requests.post(
-    "http://localhost:8000/v1/chat/completions",
-    json={
-        "model": "Qwen2-0.5B",
-        "messages": [
-            {"role": "user", "content": "写一篇短文章介绍人工智能"}
-        ],
-        "stream": True
-    },
-    stream=True
-)
+1. Automatic model downloading from HuggingFace
+2. Simple configuration of optimization parameters
+3. Clean interruption handling
+4. Helpful status messages
 
-for line in response.iter_lines():
-    if line:
-        line = line.decode('utf-8')
-        if line.startswith('data: '):
-            if line == 'data: [DONE]':
-                break
-            data = json.loads(line[6:])
-            delta = data['choices'][0].get('delta', {}).get('content', '')
-            if delta:
-                print(delta, end='', flush=True)
-print()
-```
+All in less than 100 lines of core code!
 
-## 📋 API 参考
-
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/v1/chat/completions` | POST | 聊天完成接口，支持流式输出 |
-| `/v1/models` | GET | 获取可用模型 |
-| `/health` | GET | 健康检查 |
-
-## 🚀 适用场景
-
-- 快速测试各种开源 LLM 模型效果
-- 原型项目开发和验证
-- 本地 AI 应用开发调试
-- 教学和学习 LLM API 调用
-- 无需联网的离线演示
-
-
-## 📝 许可证
+## 📝 License
 
 MIT License
 
 Copyright (c) 2024 samzong
 
-详见 [LICENSE](LICENSE) 文件 
+See the [LICENSE](LICENSE) file for details.
